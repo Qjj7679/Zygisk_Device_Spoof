@@ -57,6 +57,8 @@ ui_print "- Extracting module files"
 extract "$ZIPFILE" 'module.prop'     "$MODPATH"
 extract "$ZIPFILE" 'post-fs-data.sh' "$MODPATH"
 extract "$ZIPFILE" 'service.sh'      "$MODPATH"
+extract "$ZIPFILE" 'config/config.json' "$MODPATH"
+extract "$ZIPFILE" 'config/README.md' "$MODPATH"
 mv "$TMPDIR/sepolicy.rule" "$MODPATH"
 
 HAS32BIT=false && ([ $(getprop ro.product.cpu.abilist32) ] || [ $(getprop ro.system.product.cpu.abilist32) ]) && HAS32BIT=true

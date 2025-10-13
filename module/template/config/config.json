@@ -1,0 +1,22 @@
+{
+  "apps": [
+    {
+      "package": "com.example.targetapp",
+      "brand": "Google",
+      "model": "Pixel 7",
+      "manufacturer": "Google",
+      "device": "cheetah",
+      "product": "cheetah"
+    },
+    {
+      "package": "com.example.targetapp2",
+      "brand": "Samsung",
+      "model": "Galaxy S23",
+      "manufacturer": "Samsung",
+      "device": "dm3q",
+      "product": "dm3qxxx"
+    }
+  ]
+}
+
+

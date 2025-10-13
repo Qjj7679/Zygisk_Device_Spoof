@@ -28,10 +28,22 @@ android {
             cmake {
                 cppFlags("-std=c++20")
                 arguments(
-                    "-DANDROID_STL=none",
+                    "-DANDROID_STL=c++_static",
                     "-DMODULE_NAME=$moduleId"
                 )
             }
+        }
+    }
+    buildTypes {
+        debug {
+            externalNativeBuild {
+                cmake {
+                    cppFlags("-DDEBUG")
+                }
+            }
+        }
+        release {
+            // No extra flags for release
         }
     }
     externalNativeBuild {
@@ -65,7 +77,7 @@ androidComponents.onVariants { variant ->
         val zipFileName =
             "$moduleName-$verName-$verCode-$commitHash-$buildTypeLowered.zip".replace(' ', '-')
 
-        val prepareModuleFilesTask = task<Sync>("prepareModuleFiles$variantCapped") {
+        val prepareModuleFilesTask = tasks.register<Sync>("prepareModuleFiles$variantCapped") {
             group = "module"
             dependsOn("assemble$variantCapped")
             into(moduleDir)
@@ -113,7 +125,7 @@ androidComponents.onVariants { variant ->
             }
         }
 
-        val zipTask = task<Zip>("zip$variantCapped") {
+        val zipTask = tasks.register<Zip>("zip$variantCapped") {
             group = "module"
             dependsOn(prepareModuleFilesTask)
             archiveFileName.set(zipFileName)
@@ -121,13 +133,13 @@ androidComponents.onVariants { variant ->
             from(moduleDir)
         }
 
-        val pushTask = task<Exec>("push$variantCapped") {
+        val pushTask = tasks.register<Exec>("push$variantCapped") {
             group = "module"
             dependsOn(zipTask)
-            commandLine("adb", "push", zipTask.outputs.files.singleFile.path, "/data/local/tmp")
+            commandLine("adb", "push", zipTask.flatMap { it.archiveFile }, "/data/local/tmp")
         }
 
-        val installKsuTask = task<Exec>("installKsu$variantCapped") {
+        val installKsuTask = tasks.register<Exec>("installKsu$variantCapped") {
             group = "module"
             dependsOn(pushTask)
             commandLine(
@@ -136,7 +148,7 @@ androidComponents.onVariants { variant ->
             )
         }
 
-        val installMagiskTask = task<Exec>("installMagisk$variantCapped") {
+        val installMagiskTask = tasks.register<Exec>("installMagisk$variantCapped") {
             group = "module"
             dependsOn(pushTask)
             commandLine(
@@ -149,13 +161,13 @@ androidComponents.onVariants { variant ->
             )
         }
 
-        task<Exec>("installKsuAndReboot$variantCapped") {
+        tasks.register<Exec>("installKsuAndReboot$variantCapped") {
             group = "module"
             dependsOn(installKsuTask)
             commandLine("adb", "reboot")
         }
 
-        task<Exec>("installMagiskAndReboot$variantCapped") {
+        tasks.register<Exec>("installMagiskAndReboot$variantCapped") {
             group = "module"
             dependsOn(installMagiskTask)
             commandLine("adb", "reboot")

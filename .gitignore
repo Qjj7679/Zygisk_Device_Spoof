@@ -1,10 +1,32 @@
+# IDE
+.idea/
+.vscode/
 *.iml
-.gradle
-/local.properties
-/.idea
-.DS_Store
-/build
-/captures
-.externalNativeBuild
-.cxx
+*.ipr
+*.iws
+
+# Android/Gradle
+.gradle/
+build/
+app/build/
+module/build/
 local.properties
+*~
+.DS_Store
+*.apk
+*.ap_
+*.aab
+*.aar
+*.jar
+*.zip
+
+# CMake
+.cxx/
+module/.cxx/
+
+# User Specific
+.cursor/
+
+# OS
+.DS_Store
+Thumbs.db
