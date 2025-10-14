@@ -51,8 +51,8 @@
   ```
 
 ### 2. 生效方式
-- 将模块刷入 Magisk/Kernel SU/APatch 并重启。
-- 在指定路径找到 `config.json` 文件并编辑您的规则。
+- 将模块刷入 Magisk / Kernel SU / APatch 并重启手机。
+- 在指定路径下找到 `config.json` 文件并编辑您的规则。
 - **无需再次重启**，Companion 进程会自动加载您的配置。
 - 当您修改 `config.json` 并保存后，热加载功能会自动让新配置生效。
 
