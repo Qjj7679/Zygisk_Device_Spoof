@@ -26,7 +26,7 @@ android {
             }
             */
             cmake {
-                cppFlags("-std=c++20")
+                cppFlags("-std=c++20", "-Wno-deprecated-declarations")
                 arguments(
                     "-DANDROID_STL=c++_static",
                     "-DMODULE_NAME=$moduleId"
