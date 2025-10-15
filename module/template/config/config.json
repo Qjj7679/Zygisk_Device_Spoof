@@ -2,19 +2,23 @@
   "apps": [
     {
       "package": "com.example.targetapp",
-      "brand": "Google",
-      "model": "Pixel 7",
-      "manufacturer": "Google",
-      "device": "cheetah",
-      "product": "cheetah"
+      "properties": {
+        "ro.product.brand": "Google",
+        "ro.product.model": "Pixel 7",
+        "ro.product.manufacturer": "Google",
+        "ro.product.device": "cheetah",
+        "ro.build.product": "cheetah"
+      }
     },
     {
       "package": "com.example.targetapp2",
-      "brand": "Samsung",
-      "model": "Galaxy S23",
-      "manufacturer": "Samsung",
-      "device": "dm3q",
-      "product": "dm3qxxx"
+      "properties": {
+        "ro.product.brand": "Samsung",
+        "ro.product.model": "Galaxy S23",
+        "ro.product.manufacturer": "Samsung",
+        "ro.product.device": "dm3q",
+        "ro.build.product": "dm3qxxx"
+      }
     }
   ]
 }

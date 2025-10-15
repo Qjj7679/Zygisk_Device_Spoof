@@ -17,6 +17,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
+#include <vector>
 #include <fstream>
 #include <sstream>
 #include <string_view>
@@ -48,24 +49,8 @@ using zygisk::ServerSpecializeArgs;
 #define LOGE(...)
 #endif
 
-// 设备信息结构
-struct DeviceInfo {
-    std::string brand;
-    std::string model;
-    std::string device;
-    std::string manufacturer;
-    std::string product;
-};
-
-// 用于 IPC 的固定大小设备信息结构
-struct DeviceInfoIPC {
-    bool match_found;
-    char brand[128];
-    char model[128];
-    char device[128];
-    char manufacturer[128];
-    char product[128];
-};
+// 设备信息现在是一个通用的属性 map
+using DeviceInfo = std::unordered_map<std::string, std::string>;
 
 // 全局变量 (Companion 进程)
 static std::unordered_map<std::string, DeviceInfo> package_map;
@@ -75,16 +60,14 @@ static int lock_fd = -1;
 
 // 全局变量 (Zygisk 模块)
 static std::once_flag build_class_init_flag;
+static DeviceInfo g_spoof_properties; // 存储当前进程的伪装属性
+static int (*orig_system_property_get)(const char*, char*);
 static jclass buildClass = nullptr;
 static jfieldID modelField = nullptr;
 static jfieldID brandField = nullptr;
 static jfieldID deviceField = nullptr;
 static jfieldID manufacturerField = nullptr;
 static jfieldID productField = nullptr;
-
-// 为原生层 Hook 定义的全局变量
-static DeviceInfo g_device_info; // 存储当前进程的伪装信息
-static int (*orig_system_property_get)(const char*, char*);
 
 
 // 配置文件路径
@@ -184,14 +167,21 @@ bool reloadConfig(bool force) {
         std::string package = app["package"].GetString();
         DeviceInfo info;
 
-        if (app.HasMember("brand") && app["brand"].IsString()) info.brand = app["brand"].GetString();
-        if (app.HasMember("model") && app["model"].IsString()) info.model = app["model"].GetString();
-        if (app.HasMember("device") && app["device"].IsString()) info.device = app["device"].GetString();
-        if (app.HasMember("manufacturer") && app["manufacturer"].IsString()) info.manufacturer = app["manufacturer"].GetString();
-        if (app.HasMember("product") && app["product"].IsString()) info.product = app["product"].GetString();
+        if (app.HasMember("properties") && app["properties"].IsObject()) {
+            for (const auto& prop : app["properties"].GetObject()) {
+                if (prop.value.IsString()) {
+                    std::string value_str = prop.value.GetString();
+                    if (!value_str.empty()) { // 关键修复：忽略空值属性
+                        info[prop.name.GetString()] = value_str;
+                    }
+                }
+            }
+        }
 
-        package_map[package] = info;
-        LOGD("Companion: Loaded config for package: %s", package.c_str());
+        if (!info.empty()) {
+            package_map[package] = info;
+            LOGD("Companion: Loaded %zu properties for package: %s", info.size(), package.c_str());
+        }
     }
 
     LOGI("Companion: Config loaded/reloaded: %zu apps", package_map.size());
@@ -244,24 +234,9 @@ int my_system_property_get(const char* name, char* value) {
     
     in_hook = true; // 设置标志
     
-    std::string_view prop_name(name);
-    std::string spoof_val;
-
-    // 根据属性名称，返回对应的伪装值
-    if (prop_name == "ro.product.brand" && !g_device_info.brand.empty()) {
-        spoof_val = g_device_info.brand;
-    } else if (prop_name == "ro.product.model" && !g_device_info.model.empty()) {
-        spoof_val = g_device_info.model;
-    } else if (prop_name == "ro.product.device" && !g_device_info.device.empty()) {
-        spoof_val = g_device_info.device;
-    } else if (prop_name == "ro.product.manufacturer" && !g_device_info.manufacturer.empty()) {
-        spoof_val = g_device_info.manufacturer;
-    } else if (prop_name == "ro.build.product" && !g_device_info.product.empty()) {
-        spoof_val = g_device_info.product;
-    }
-
-    if (!spoof_val.empty()) {
-        // 关键修复：移除这里的 LOGD 调用以避免无限递归
+    auto it = g_spoof_properties.find(name);
+    if (it != g_spoof_properties.end()) {
+        const std::string& spoof_val = it->second;
         strncpy(value, spoof_val.c_str(), PROPERTY_VALUE_MAX - 1);
         value[PROPERTY_VALUE_MAX - 1] = '\0';
         in_hook = false; // 恢复标志
@@ -377,42 +352,52 @@ public:
 
         write(fd, packageName.c_str(), strlen(packageName.c_str()) + 1);
 
-        DeviceInfoIPC ipc_info{};
-        read(fd, &ipc_info, sizeof(ipc_info));
+        // 动态读取 Companion 发送的数据
+        std::vector<char> buffer(4096);
+        int bytes_read = read(fd, buffer.data(), buffer.size() - 1);
         close(fd);
 
-        if (ipc_info.match_found) {
-            DeviceInfo info {
-                .brand = ipc_info.brand,
-                .model = ipc_info.model,
-                .device = ipc_info.device,
-                .manufacturer = ipc_info.manufacturer,
-                .product = ipc_info.product,
-            };
-            g_device_info = info; // 为原生 Hook 保存信息
-            spoofDevice(info);
-            LOGI("Package matched: %s", packageName.c_str());
+        if (bytes_read > 0) {
+            buffer[bytes_read] = '\0'; // 确保 C 风格字符串安全
 
-            // 添加原生层 Hook
-            dev_t libc_dev = 0;
-            ino_t libc_ino = 0;
-            bool hook_successful = false;
-            if (get_libc_info(libc_dev, libc_ino)) {
-                api->pltHookRegister(libc_dev, libc_ino, "__system_property_get",
-                                     (void*)my_system_property_get,
-                                     (void**)&orig_system_property_get);
-                if (api->pltHookCommit()) {
-                    LOGI("Successfully hooked __system_property_get");
-                    hook_successful = true;
+            // 反序列化属性
+            const char* p = buffer.data();
+            while (*p) {
+                std::string key = p;
+                p += key.length() + 1;
+                if (!*p) break; // 避免 key 后面没有 value 的情况
+                std::string val = p;
+                p += val.length() + 1;
+                g_spoof_properties[key] = val;
+            }
+
+            if (!g_spoof_properties.empty()) {
+                spoofDevice(g_spoof_properties);
+                LOGI("Package matched: %s, applied %zu properties.", packageName.c_str(), g_spoof_properties.size());
+
+                // 添加原生层 Hook
+                dev_t libc_dev = 0;
+                ino_t libc_ino = 0;
+                bool hook_successful = false;
+                if (get_libc_info(libc_dev, libc_ino)) {
+                    api->pltHookRegister(libc_dev, libc_ino, "__system_property_get",
+                                         (void*)my_system_property_get,
+                                         (void**)&orig_system_property_get);
+                    if (api->pltHookCommit()) {
+                        LOGI("Successfully hooked __system_property_get");
+                        hook_successful = true;
+                    } else {
+                        LOGE("Failed to commit __system_property_get hook");
+                    }
                 } else {
-                    LOGE("Failed to commit __system_property_get hook");
+                    LOGE("Failed to find libc.so information for native hook");
+                }
+                 // 如果 Hook 成功，则不卸载模块，否则卸载
+                if (!hook_successful) {
+                    unloadModule();
                 }
             } else {
-                LOGE("Failed to find libc.so information for native hook");
-            }
-             // 如果 Hook 成功，则不卸载模块，否则卸载
-            if (!hook_successful) {
-                unloadModule();
+                 unloadModule(); // 没有属性需要伪装
             }
         } else {
             LOGD("Package not in config, unloading");
@@ -463,7 +448,7 @@ private:
         }
 
         auto setField = [this](jfieldID field, const std::string& value, const char* name) {
-            if (value.empty()) return;
+            if (value.empty() || !field) return;
 
             jstring jstr = env->NewStringUTF(value.c_str());
             if (!jstr || checkAndClearException(env, "NewStringUTF")) {
@@ -479,13 +464,15 @@ private:
             env->DeleteLocalRef(jstr);
         };
 
-        setField(modelField, info.model, "MODEL");
-        setField(brandField, info.brand, "BRAND");
-        setField(deviceField, info.device, "DEVICE");
-        setField(manufacturerField, info.manufacturer, "MANUFACTURER");
-        setField(productField, info.product, "PRODUCT");
+        for (const auto& [key, value] : info) {
+            if (key == "ro.product.model") setField(modelField, value, "MODEL");
+            else if (key == "ro.product.brand") setField(brandField, value, "BRAND");
+            else if (key == "ro.product.device") setField(deviceField, value, "DEVICE");
+            else if (key == "ro.product.manufacturer") setField(manufacturerField, value, "MANUFACTURER");
+            else if (key == "ro.build.product") setField(productField, value, "PRODUCT");
+        }
 
-        LOGI("Spoofed device to: %s %s", info.brand.c_str(), info.model.c_str());
+        LOGI("JNI fields spoofed based on config.");
     }
 
     void unloadModule() {
@@ -510,23 +497,23 @@ static void companion_handler(int socket_fd) {
     }
 
     LOGD("Companion: Received request for package: %s", pkg);
-    DeviceInfoIPC ipc_info{};
-    ipc_info.match_found = false;
     {
         std::shared_lock<std::shared_mutex> lock(config_mutex);
         auto it = package_map.find(pkg);
         if (it != package_map.end()) {
-            ipc_info.match_found = true;
-            const auto& info = it->second;
-            strncpy(ipc_info.brand, info.brand.c_str(), sizeof(ipc_info.brand) - 1);
-            strncpy(ipc_info.model, info.model.c_str(), sizeof(ipc_info.model) - 1);
-            strncpy(ipc_info.device, info.device.c_str(), sizeof(ipc_info.device) - 1);
-            strncpy(ipc_info.manufacturer, info.manufacturer.c_str(), sizeof(ipc_info.manufacturer) - 1);
-            strncpy(ipc_info.product, info.product.c_str(), sizeof(ipc_info.product) - 1);
+            const auto& props = it->second;
+            std::string buffer;
+            for (const auto& [key, val] : props) {
+                buffer.append(key);
+                buffer.push_back('\0');
+                buffer.append(val);
+                buffer.push_back('\0');
+            }
+            if (!buffer.empty()) {
+                write(socket_fd, buffer.c_str(), buffer.length());
+            }
         }
     }
-    write(socket_fd, &ipc_info, sizeof(ipc_info));
-    
     close(socket_fd);
 }
 
