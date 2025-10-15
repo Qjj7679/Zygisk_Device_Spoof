@@ -27,6 +27,8 @@
 #define PROPERTY_VALUE_MAX 92
 #endif
 #include <sys/sysmacros.h>
+#include <time.h>
+#include <stdarg.h>
 
 #include "zygisk.hpp"
 #include "document.h"
@@ -48,6 +50,51 @@ using zygisk::ServerSpecializeArgs;
 #define LOGW(...)
 #define LOGE(...)
 #endif
+
+// For runtime debug logging
+static bool g_is_debug_enabled = false;
+static std::mutex g_log_mutex;
+constexpr const char* DEBUG_FLAG_PATH = "/data/adb/modules/zygisk_device_spoof/DEBUG";
+constexpr const char* LOG_FILE_PATH = "/data/adb/modules/zygisk_device_spoof/debug.log";
+
+static void log_to_file(const char* fmt, ...) {
+    if (!g_is_debug_enabled) return;
+
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    FILE* fp = fopen(LOG_FILE_PATH, "a");
+    if (!fp) return;
+
+    time_t now = time(nullptr);
+    tm tm_now;
+    localtime_r(&now, &tm_now);
+    char time_buf[32];
+    strftime(time_buf, sizeof(time_buf), "%m-%d %H:%M:%S", &tm_now);
+    fprintf(fp, "[%s] [%d] ", time_buf, getpid());
+
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(fp, fmt, args);
+    va_end(args);
+    fprintf(fp, "\n");
+    fclose(fp);
+}
+
+static void initialize_logging(bool is_companion) {
+    if (access(DEBUG_FLAG_PATH, F_OK) != 0) {
+        g_is_debug_enabled = false;
+        return;
+    }
+
+    g_is_debug_enabled = true;
+    if (is_companion) {
+        // Companion process clears the log file on its first startup
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        if (FILE* fp = fopen(LOG_FILE_PATH, "w")) {
+            fclose(fp);
+        }
+    }
+    log_to_file("Debug logging enabled for process %d (is_companion=%d)", getpid(), is_companion);
+}
 
 // 设备信息现在是一个通用的属性 map
 using DeviceInfo = std::unordered_map<std::string, std::string>;
@@ -237,6 +284,7 @@ int my_system_property_get(const char* name, char* value) {
     auto it = g_spoof_properties.find(name);
     if (it != g_spoof_properties.end()) {
         const std::string& spoof_val = it->second;
+        log_to_file("Spoofing property '%s' to '%s'", name, spoof_val.c_str());
         strncpy(value, spoof_val.c_str(), PROPERTY_VALUE_MAX - 1);
         value[PROPERTY_VALUE_MAX - 1] = '\0';
         in_hook = false; // 恢复标志
@@ -298,6 +346,8 @@ void monitor_config_thread() {
 }
 
 void companion_init() {
+    initialize_logging(true);
+
     // 1. 打开或创建锁文件
     lock_fd = open(COMPANION_LOCK_PATH, O_RDWR | O_CREAT, 0644);
     if (lock_fd < 0) {
@@ -326,6 +376,7 @@ public:
     void onLoad(Api *api, JNIEnv *env) override {
         this->api = api;
         this->env = env;
+        initialize_logging(false);
         ensureBuildClass();
     }
 
