@@ -17,6 +17,15 @@
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
+#include <fstream>
+#include <sstream>
+#include <string_view>
+#include <sys/system_properties.h>
+// PROPERTY_VALUE_MAX might not be defined in old NDK headers.
+#ifndef PROPERTY_VALUE_MAX
+#define PROPERTY_VALUE_MAX 92
+#endif
+#include <sys/sysmacros.h>
 
 #include "zygisk.hpp"
 #include "document.h"
@@ -72,6 +81,11 @@ static jfieldID brandField = nullptr;
 static jfieldID deviceField = nullptr;
 static jfieldID manufacturerField = nullptr;
 static jfieldID productField = nullptr;
+
+// 为原生层 Hook 定义的全局变量
+static DeviceInfo g_device_info; // 存储当前进程的伪装信息
+static int (*orig_system_property_get)(const char*, char*);
+
 
 // 配置文件路径
 constexpr const char* CONFIG_DIR = "/data/adb/modules/zygisk_device_spoof/config/";
@@ -183,6 +197,82 @@ bool reloadConfig(bool force) {
     LOGI("Companion: Config loaded/reloaded: %zu apps", package_map.size());
     return true;
 }
+
+// 辅助函数：获取 libc.so 的设备和 inode 信息
+static bool get_libc_info(dev_t& dev, ino_t& inode) {
+    std::ifstream maps("/proc/self/maps");
+    std::string line;
+    while (std::getline(maps, line)) {
+        std::string_view sv(line);
+        // 通常 libc.so 路径是以 /libc.so 结尾
+        if (sv.find("libc.so") != std::string::npos && sv.ends_with(".so")) {
+            std::stringstream ss(line);
+            std::string addr, perms, offset, dev_str, inode_str, path;
+            ss >> addr >> perms >> offset >> dev_str >> inode_str >> path;
+
+            // 确认路径确实是 libc.so
+             if (path.ends_with("/libc.so")) {
+                unsigned int dev_major, dev_minor;
+                if (sscanf(dev_str.c_str(), "%x:%x", &dev_major, &dev_minor) != 2) continue;
+
+                inode = std::stoul(inode_str);
+                dev = makedev(dev_major, dev_minor);
+                LOGD("Found libc.so in %s: dev=%lx, inode=%lu", path.c_str(), dev, inode);
+                return true;
+            }
+        }
+    }
+    LOGE("libc.so not found in maps");
+    return false;
+}
+
+// Hook 函数：替换 __system_property_get
+int my_system_property_get(const char* name, char* value) {
+    // 使用 thread_local 防止无限递归
+    thread_local bool in_hook = false;
+    if (in_hook) {
+        // 如果我们正在重入，直接调用原始函数
+        if (orig_system_property_get) return orig_system_property_get(name, value);
+        return -1;
+    }
+
+    if (!name || !orig_system_property_get) {
+        if (orig_system_property_get) return orig_system_property_get(name, value);
+        // 如果原始函数指针为空，无法继续
+        return -1;
+    }
+    
+    in_hook = true; // 设置标志
+    
+    std::string_view prop_name(name);
+    std::string spoof_val;
+
+    // 根据属性名称，返回对应的伪装值
+    if (prop_name == "ro.product.brand" && !g_device_info.brand.empty()) {
+        spoof_val = g_device_info.brand;
+    } else if (prop_name == "ro.product.model" && !g_device_info.model.empty()) {
+        spoof_val = g_device_info.model;
+    } else if (prop_name == "ro.product.device" && !g_device_info.device.empty()) {
+        spoof_val = g_device_info.device;
+    } else if (prop_name == "ro.product.manufacturer" && !g_device_info.manufacturer.empty()) {
+        spoof_val = g_device_info.manufacturer;
+    } else if (prop_name == "ro.build.product" && !g_device_info.product.empty()) {
+        spoof_val = g_device_info.product;
+    }
+
+    if (!spoof_val.empty()) {
+        // 关键修复：移除这里的 LOGD 调用以避免无限递归
+        strncpy(value, spoof_val.c_str(), PROPERTY_VALUE_MAX - 1);
+        value[PROPERTY_VALUE_MAX - 1] = '\0';
+        in_hook = false; // 恢复标志
+        return strlen(value);
+    }
+
+    int result = orig_system_property_get(name, value);
+    in_hook = false; // 恢复标志
+    return result;
+}
+
 
 void monitor_config_thread() {
     int fd = inotify_init();
@@ -299,13 +389,35 @@ public:
                 .manufacturer = ipc_info.manufacturer,
                 .product = ipc_info.product,
             };
+            g_device_info = info; // 为原生 Hook 保存信息
             spoofDevice(info);
             LOGI("Package matched: %s", packageName.c_str());
+
+            // 添加原生层 Hook
+            dev_t libc_dev = 0;
+            ino_t libc_ino = 0;
+            bool hook_successful = false;
+            if (get_libc_info(libc_dev, libc_ino)) {
+                api->pltHookRegister(libc_dev, libc_ino, "__system_property_get",
+                                     (void*)my_system_property_get,
+                                     (void**)&orig_system_property_get);
+                if (api->pltHookCommit()) {
+                    LOGI("Successfully hooked __system_property_get");
+                    hook_successful = true;
+                } else {
+                    LOGE("Failed to commit __system_property_get hook");
+                }
+            } else {
+                LOGE("Failed to find libc.so information for native hook");
+            }
+             // 如果 Hook 成功，则不卸载模块，否则卸载
+            if (!hook_successful) {
+                unloadModule();
+            }
         } else {
             LOGD("Package not in config, unloading");
+            unloadModule();
         }
-
-        unloadModule();
     }
 
 private:
