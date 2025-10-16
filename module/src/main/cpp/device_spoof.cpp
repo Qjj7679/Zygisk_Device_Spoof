@@ -247,9 +247,16 @@ private:
 // --- Companion Implementation ---
 
 static void companion_handler(int i) {
+    // 1. First, read the unique data from the socket. This can be done in parallel.
+    char target_package[256] = {0};
+    if (read(i, target_package, sizeof(target_package) -1) < 0) {
+        close(i);
+        return;
+    }
+
+    // 2. Now, acquire the lock just before accessing the shared resource (config file).
     char lock_path[256];
     snprintf(lock_path, sizeof(lock_path), "/data/adb/modules/%s/companion.lock", MODULE_ID);
-
     int lock_fd = open(lock_path, O_RDONLY | O_CREAT, 0644);
     if (lock_fd >= 0) {
         if (flock(lock_fd, LOCK_EX) == -1) {
@@ -259,6 +266,7 @@ static void companion_handler(int i) {
         LOGD("Failed to open companion lock file %s", lock_path);
     }
 
+    // 3. Access the shared resource.
     std::string config_data = read_config_blocking();
     if (config_data.empty()) {
         if (lock_fd >= 0) close(lock_fd);
@@ -266,13 +274,6 @@ static void companion_handler(int i) {
         return;
     }
     
-    char target_package[256] = {0};
-    if (read(i, target_package, sizeof(target_package) -1) < 0) {
-        if (lock_fd >= 0) close(lock_fd);
-        close(i);
-        return;
-    }
-
     rapidjson::Document document;
     document.Parse(config_data.c_str());
 
@@ -316,7 +317,8 @@ static void companion_handler(int i) {
         write_data_to_socket(i, buffer_str.c_str(), buffer_str.length());
     }
     
-    if (lock_fd >= 0) close(lock_fd); // Release the lock
+    // 4. Release the lock and close the connection.
+    if (lock_fd >= 0) close(lock_fd);
     close(i);
 }
 
