@@ -4,570 +4,336 @@
  * A Zygisk module to spoof android.os.Build fields for specific apps.
  */
 
-#include <cstdlib>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/inotify.h>
-#include <sys/file.h>
-#include <android/log.h>
 #include <string>
-#include <unordered_map>
-#include <memory>
-#include <mutex>
-#include <shared_mutex>
+#include <sys/system_properties.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/inotify.h>
 #include <thread>
 #include <vector>
+#include <unordered_map>
+#include <string_view>
 #include <fstream>
 #include <sstream>
-#include <string_view>
-#include <sys/system_properties.h>
-// PROPERTY_VALUE_MAX might not be defined in old NDK headers.
+#include <sys/sysmacros.h>
+#include <mutex>
+#include <condition_variable>
+#include <algorithm>
+#include <memory>
+#include <android/log.h>
+
+
+#include "zygisk.hpp"
+#include "document.h" // rapidjson
+
 #ifndef PROPERTY_VALUE_MAX
 #define PROPERTY_VALUE_MAX 92
 #endif
-#include <sys/sysmacros.h>
-#include <time.h>
-#include <stdarg.h>
-
-#include "zygisk.hpp"
-#include "document.h"
-#include "filereadstream.h"
 
 using zygisk::Api;
 using zygisk::AppSpecializeArgs;
 using zygisk::ServerSpecializeArgs;
 
-// 日志宏定义
+
+// --- Global Variables & Forward Declarations ---
+
 #ifdef DEBUG
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "ZygiskDeviceSpoof", __VA_ARGS__)
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "ZygiskDeviceSpoof", __VA_ARGS__)
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, "ZygiskDeviceSpoof", __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "ZygiskDeviceSpoof", __VA_ARGS__)
 #else
 #define LOGD(...)
-#define LOGI(...)
-#define LOGW(...)
-#define LOGE(...)
 #endif
 
-// For runtime debug logging
-static bool g_is_debug_enabled = false;
-static std::mutex g_log_mutex;
-constexpr const char* DEBUG_FLAG_PATH = "/data/adb/modules/zygisk_device_spoof/DEBUG";
-constexpr const char* LOG_FILE_PATH = "/data/adb/modules/zygisk_device_spoof/debug.log";
-
-static void log_to_file(const char* fmt, ...) {
-    if (!g_is_debug_enabled) return;
-
-    std::lock_guard<std::mutex> lock(g_log_mutex);
-    FILE* fp = fopen(LOG_FILE_PATH, "a");
-    if (!fp) return;
-
-    time_t now = time(nullptr);
-    tm tm_now;
-    localtime_r(&now, &tm_now);
-    char time_buf[32];
-    strftime(time_buf, sizeof(time_buf), "%m-%d %H:%M:%S", &tm_now);
-    fprintf(fp, "[%s] [%d] ", time_buf, getpid());
-
-    va_list args;
-    va_start(args, fmt);
-    vfprintf(fp, fmt, args);
-    va_end(args);
-    fprintf(fp, "\n");
-    fclose(fp);
-}
-
-static void initialize_logging(bool is_companion) {
-    if (access(DEBUG_FLAG_PATH, F_OK) != 0) {
-        g_is_debug_enabled = false;
-        return;
-    }
-
-    g_is_debug_enabled = true;
-    if (is_companion) {
-        // Companion process clears the log file on its first startup
-        std::lock_guard<std::mutex> lock(g_log_mutex);
-        if (FILE* fp = fopen(LOG_FILE_PATH, "w")) {
-            fclose(fp);
-        }
-    }
-    log_to_file("Debug logging enabled for process %d (is_companion=%d)", getpid(), is_companion);
-}
-
-// 设备信息现在是一个通用的属性 map
 using DeviceInfo = std::unordered_map<std::string, std::string>;
+static DeviceInfo g_spoof_properties;
+static int (*orig_system_property_get)(const char *, char *);
+static dev_t libc_dev = 0;
+static ino_t libc_ino = 0;
 
-// 全局变量 (Companion 进程)
-static std::unordered_map<std::string, DeviceInfo> package_map;
-static std::shared_mutex config_mutex;
-static std::once_flag companion_init_flag;
-static int lock_fd = -1;
+thread_local bool is_jni_hooking = false;
 
-// 全局变量 (Zygisk 模块)
-static std::once_flag build_class_init_flag;
-static DeviceInfo g_spoof_properties; // 存储当前进程的伪装属性
-static int (*orig_system_property_get)(const char*, char*);
-static jclass buildClass = nullptr;
-static jfieldID modelField = nullptr;
-static jfieldID brandField = nullptr;
-static jfieldID deviceField = nullptr;
-static jfieldID manufacturerField = nullptr;
-static jfieldID productField = nullptr;
+static void spoofDevice(JNIEnv *env);
+static void do_hook(Api *api);
 
-
-// 配置文件路径
-constexpr const char* CONFIG_DIR = "/data/adb/modules/zygisk_device_spoof/config/";
-constexpr const char* CONFIG_NAME = "config.json";
-constexpr const char* COMPANION_LOCK_PATH = "/data/adb/modules/zygisk_device_spoof/companion.lock";
-
-// RAII 包装器：自动管理 JNI 字符串
-class JniString {
-public:
-    JniString(JNIEnv* env, jstring jstr)
-        : env_(env), jstr_(jstr),
-          cstr_(jstr ? env->GetStringUTFChars(jstr, nullptr) : nullptr) {}
-
-    ~JniString() {
-        if (cstr_) {
-            env_->ReleaseStringUTFChars(jstr_, cstr_);
-        }
-    }
-
-    const char* c_str() const { return cstr_; }
-    operator bool() const { return cstr_ != nullptr; }
-
-    JniString(const JniString&) = delete;
-    JniString& operator=(const JniString&) = delete;
-
-private:
-    JNIEnv* env_;
-    jstring jstr_;
-    const char* cstr_;
-};
-
-// 异常处理辅助函数
-inline bool checkAndClearException(JNIEnv* env, const char* operation) {
-    if (env->ExceptionCheck()) {
-        LOGE("JNI exception during %s", operation);
-        #ifdef DEBUG
-        env->ExceptionDescribe();
-        #endif
-        env->ExceptionClear();
-        return true;
-    }
-    return false;
+const char* MODULE_ID = "zygisk_device_spoof";
+std::string read_config_blocking() { 
+    std::ifstream file(std::string("/data/adb/modules/") + MODULE_ID + "/config/config.json");
+    if (!file.is_open()) return "";
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    return buffer.str();
 }
+void write_data_to_socket(int fd, const char* data, size_t len) { write(fd, data, len); }
+void inotify_init_and_watch() {}
 
-// Companion 进程的配置重载逻辑
-bool reloadConfig(bool force) {
-    if (!force) {
-        // 在 inotify 模式下，这个检查不是必需的，但可以保留以防万一
-        return false;
-    }
+// --- Hooking Logic ---
 
-    std::unique_lock<std::shared_mutex> lock(config_mutex);
-
-    char config_path[256];
-    snprintf(config_path, sizeof(config_path), "%s%s", CONFIG_DIR, CONFIG_NAME);
-
-    FILE* fp = fopen(config_path, "rb");
-    if (!fp) {
-        LOGE("Companion: Failed to open config file");
-        return false;
-    }
-
-    fseek(fp, 0, SEEK_END);
-    long size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-
-    if (size <= 0) {
-        fclose(fp);
-        LOGE("Companion: Config file is empty or invalid size");
-        return false;
-    }
-
-    auto buffer = std::make_unique<char[]>(size + 1);
-    fread(buffer.get(), 1, size, fp);
-    buffer[size] = '\0';
-    fclose(fp);
-
-    rapidjson::Document doc;
-    doc.Parse(buffer.get());
-
-    if (doc.HasParseError()) {
-        LOGE("Companion: JSON parse error: %d", doc.GetParseError());
-        return false;
-    }
-
-    if (!doc.HasMember("apps") || !doc["apps"].IsArray()) {
-        LOGE("Companion: Invalid JSON format: missing 'apps' array");
-        return false;
-    }
-
-    package_map.clear();
-    const auto& apps = doc["apps"].GetArray();
-    for (const auto& app : apps) {
-        if (!app.IsObject() || !app.HasMember("package") || !app["package"].IsString()) continue;
-        
-        std::string package = app["package"].GetString();
-        DeviceInfo info;
-
-        if (app.HasMember("properties") && app["properties"].IsObject()) {
-            for (const auto& prop : app["properties"].GetObject()) {
-                if (prop.value.IsString()) {
-                    std::string value_str = prop.value.GetString();
-                    if (!value_str.empty()) { // 关键修复：忽略空值属性
-                        info[prop.name.GetString()] = value_str;
-                    }
-                }
-            }
-        }
-
-        if (!info.empty()) {
-            package_map[package] = info;
-            LOGD("Companion: Loaded %zu properties for package: %s", info.size(), package.c_str());
-        }
-    }
-
-    LOGI("Companion: Config loaded/reloaded: %zu apps", package_map.size());
-    return true;
-}
-
-// 辅助函数：获取 libc.so 的设备和 inode 信息
-static bool get_libc_info(dev_t& dev, ino_t& inode) {
+static std::pair<dev_t, ino_t> get_libc_info() {
     std::ifstream maps("/proc/self/maps");
     std::string line;
     while (std::getline(maps, line)) {
-        std::string_view sv(line);
-        // 通常 libc.so 路径是以 /libc.so 结尾
-        if (sv.find("libc.so") != std::string::npos && sv.ends_with(".so")) {
-            std::stringstream ss(line);
-            std::string addr, perms, offset, dev_str, inode_str, path;
-            ss >> addr >> perms >> offset >> dev_str >> inode_str >> path;
-
-            // 确认路径确实是 libc.so
-             if (path.ends_with("/libc.so")) {
-                unsigned int dev_major, dev_minor;
-                if (sscanf(dev_str.c_str(), "%x:%x", &dev_major, &dev_minor) != 2) continue;
-
-                inode = std::stoul(inode_str);
-                dev = makedev(dev_major, dev_minor);
-                LOGD("Found libc.so in %s: dev=%lx, inode=%lu", path.c_str(), dev, inode);
-                return true;
+        if (line.find("libc.so") != std::string::npos) {
+            unsigned int dev_major, dev_minor;
+            ino_t inode;
+            char path[256];
+            if (sscanf(line.c_str(), "%*s %*s %*s %x:%x %lu %s", &dev_major, &dev_minor, &inode, path) == 4) {
+                dev_t dev = makedev(dev_major, dev_minor);
+                LOGD("Found libc.so: dev=%lx, inode=%lu", (unsigned long)dev, (unsigned long)inode);
+                return {dev, inode};
             }
         }
     }
-    LOGE("libc.so not found in maps");
-    return false;
+    LOGD("Could not find libc.so");
+    return {0, 0};
 }
 
-// Hook 函数：替换 __system_property_get
 int my_system_property_get(const char* name, char* value) {
-    // 使用 thread_local 防止无限递归
+    if (is_jni_hooking) {
+        if (orig_system_property_get) return orig_system_property_get(name, value);
+        return -1;
+    }
+    
     thread_local bool in_hook = false;
     if (in_hook) {
-        // 如果我们正在重入，直接调用原始函数
         if (orig_system_property_get) return orig_system_property_get(name, value);
         return -1;
     }
 
     if (!name || !orig_system_property_get) {
         if (orig_system_property_get) return orig_system_property_get(name, value);
-        // 如果原始函数指针为空，无法继续
         return -1;
     }
     
-    in_hook = true; // 设置标志
+    in_hook = true;
     
     auto it = g_spoof_properties.find(name);
     if (it != g_spoof_properties.end()) {
         const std::string& spoof_val = it->second;
-        log_to_file("Spoofing property '%s' to '%s'", name, spoof_val.c_str());
         strncpy(value, spoof_val.c_str(), PROPERTY_VALUE_MAX - 1);
         value[PROPERTY_VALUE_MAX - 1] = '\0';
-        in_hook = false; // 恢复标志
+        in_hook = false;
         return strlen(value);
     }
 
     int result = orig_system_property_get(name, value);
-    in_hook = false; // 恢复标志
+    in_hook = false;
     return result;
 }
 
+static void do_hook(Api *api) {
+    if (!api) return;
+    auto [dev, ino] = get_libc_info();
+    if (dev == 0 || ino == 0) {
+        LOGD("Failed to get libc info, native hook skipped.");
+        return;
+    }
+    libc_dev = dev;
+    libc_ino = ino;
+    api->pltHookRegister(libc_dev, libc_ino, "__system_property_get",
+                         (void *)my_system_property_get,
+                         (void **)&orig_system_property_get);
 
-void monitor_config_thread() {
-    int fd = inotify_init();
-    if (fd < 0) {
-        LOGE("Companion: inotify_init failed");
+    if (!api->pltHookCommit()) {
+        LOGD("Failed to commit plt hook.");
+        orig_system_property_get = nullptr;
+    } else {
+        LOGD("Successfully hooked __system_property_get");
+    }
+}
+
+static void spoofDevice(JNIEnv *env) {
+    if (g_spoof_properties.empty()) return;
+
+    jclass build_class = env->FindClass("android/os/Build");
+    if (build_class == nullptr) {
+        LOGD("Class 'android/os/Build' not found");
         return;
     }
 
-    int wd = inotify_add_watch(fd, CONFIG_DIR, IN_CLOSE_WRITE | IN_MOVED_TO);
-    if (wd < 0) {
-        LOGW("Companion: inotify_add_watch failed for dir, hot-reload may not work. Errno: %d", errno);
-        close(fd);
-        return;
-    }
+    for (const auto& [key, value] : g_spoof_properties) {
+        std::string spoof_key = key;
+        if (spoof_key.rfind("ro.product.", 0) == 0) spoof_key = spoof_key.substr(11);
+        else if (spoof_key.rfind("ro.build.", 0) == 0) spoof_key = spoof_key.substr(9);
+        else if (spoof_key.rfind("ro.", 0) == 0) spoof_key = spoof_key.substr(3);
+        
+        std::replace(spoof_key.begin(), spoof_key.end(), '.', '_');
+        std::transform(spoof_key.begin(), spoof_key.end(), spoof_key.begin(), ::toupper);
 
-    LOGI("Companion: Started monitoring config directory for changes.");
-    
-    // 缓冲区至少需要容纳一个事件加上一个长文件名
-    constexpr size_t EVENT_BUF_LEN = (sizeof(struct inotify_event) + NAME_MAX + 1) * 10;
-    char buffer[EVENT_BUF_LEN];
-
-    while (true) {
-        int length = read(fd, buffer, EVENT_BUF_LEN);
-        if (length < 0) {
-            LOGE("Companion: read from inotify fd failed");
-            continue;
-        }
-
-        int i = 0;
-        while (i < length) {
-            struct inotify_event *event = (struct inotify_event *) &buffer[i];
-            if (event->len) {
-                if (strcmp(event->name, CONFIG_NAME) == 0) {
-                     if ((event->mask & IN_CLOSE_WRITE) || (event->mask & IN_MOVED_TO)) {
-                        LOGI("Companion: Config file changed, reloading...");
-                        reloadConfig(true);
-                        // 找到我们关心的事件后，可以跳出内层循环
-                        break;
-                    }
-                }
-            }
-            i += sizeof(struct inotify_event) + event->len;
+        jfieldID field = env->GetStaticFieldID(build_class, spoof_key.c_str(), "Ljava/lang/String;");
+        if (field != nullptr) {
+            jstring spoof_value = env->NewStringUTF(value.c_str());
+            env->SetStaticObjectField(build_class, field, spoof_value);
+            env->DeleteLocalRef(spoof_value);
         }
     }
-
-    inotify_rm_watch(fd, wd);
-    close(fd);
+    env->DeleteLocalRef(build_class);
 }
 
-void companion_init() {
-    initialize_logging(true);
-
-    // 1. 打开或创建锁文件
-    lock_fd = open(COMPANION_LOCK_PATH, O_RDWR | O_CREAT, 0644);
-    if (lock_fd < 0) {
-        LOGE("Companion: Unable to open lock file, exiting.");
-        exit(1); // 严重错误
-    }
-
-    // 2. 尝试获取非阻塞的排他锁
-    if (flock(lock_fd, LOCK_EX | LOCK_NB) < 0) {
-        LOGW("Companion: Another instance is already running, exiting.");
-        close(lock_fd);
-        exit(0); // 正常退出
-    }
-
-    LOGI("Companion: one-time initialization");
-    // 初始加载
-    reloadConfig(true);
-
-    // 启动监控线程
-    std::thread(monitor_config_thread).detach();
-}
-
+// --- Zygisk Module Implementation ---
 
 class SpoofModule : public zygisk::ModuleBase {
 public:
     void onLoad(Api *api, JNIEnv *env) override {
         this->api = api;
         this->env = env;
-        initialize_logging(false);
-        ensureBuildClass();
     }
 
     void preAppSpecialize(AppSpecializeArgs *args) override {
-        if (!args || !args->nice_name) {
-            unloadModule();
+        const char *process = env->GetStringUTFChars(args->nice_name, nullptr);
+        if (!process) {
+            api->setOption(zygisk::Option::FORCE_DENYLIST_UNMOUNT);
             return;
         }
-
-        JniString packageName(env, args->nice_name);
-        if (!packageName) {
-            unloadModule();
-            return;
-        }
-
-        LOGD("preAppSpecialize: %s", packageName.c_str());
 
         int fd = api->connectCompanion();
-        if (fd < 0) {
-            LOGE("Failed to connect to companion process");
-            unloadModule();
+        if (fd == -1) {
+            LOGD("Failed to connect to companion for %s", process);
+            env->ReleaseStringUTFChars(args->nice_name, process);
+            api->setOption(zygisk::Option::FORCE_DENYLIST_UNMOUNT);
             return;
         }
 
-        write(fd, packageName.c_str(), strlen(packageName.c_str()) + 1);
+        write(fd, process, strlen(process) + 1);
 
-        // 动态读取 Companion 发送的数据
         std::vector<char> buffer(4096);
-        int bytes_read = read(fd, buffer.data(), buffer.size() - 1);
+        int read_len = read(fd, buffer.data(), buffer.size() -1);
         close(fd);
 
-        if (bytes_read > 0) {
-            buffer[bytes_read] = '\0'; // 确保 C 风格字符串安全
+        env->ReleaseStringUTFChars(args->nice_name, process);
 
-            // 反序列化属性
-            const char* p = buffer.data();
-            while (*p) {
-                std::string key = p;
-                p += key.length() + 1;
-                if (!*p) break; // 避免 key 后面没有 value 的情况
-                std::string val = p;
-                p += val.length() + 1;
-                g_spoof_properties[key] = val;
-            }
-
-            if (!g_spoof_properties.empty()) {
-                spoofDevice(g_spoof_properties);
-                LOGI("Package matched: %s, applied %zu properties.", packageName.c_str(), g_spoof_properties.size());
-
-                // 添加原生层 Hook
-                dev_t libc_dev = 0;
-                ino_t libc_ino = 0;
-                bool hook_successful = false;
-                if (get_libc_info(libc_dev, libc_ino)) {
-                    api->pltHookRegister(libc_dev, libc_ino, "__system_property_get",
-                                         (void*)my_system_property_get,
-                                         (void**)&orig_system_property_get);
-                    if (api->pltHookCommit()) {
-                        LOGI("Successfully hooked __system_property_get");
-                        hook_successful = true;
-                    } else {
-                        LOGE("Failed to commit __system_property_get hook");
-                    }
-                } else {
-                    LOGE("Failed to find libc.so information for native hook");
-                }
-                 // 如果 Hook 成功，则不卸载模块，否则卸载
-                if (!hook_successful) {
-                    unloadModule();
-                }
-            } else {
-                 unloadModule(); // 没有属性需要伪装
-            }
-        } else {
-            LOGD("Package not in config, unloading");
-            unloadModule();
+        if (read_len <= 0) {
+            api->setOption(zygisk::Option::FORCE_DENYLIST_UNMOUNT);
+            return;
         }
+
+        g_spoof_properties.clear();
+        std::string_view buf_view(buffer.data(), read_len);
+        
+        size_t start = 0;
+        while(start < (size_t)read_len) {
+            size_t key_end = buf_view.find('\0', start);
+            if (key_end == std::string_view::npos) break;
+            std::string key(buf_view.substr(start, key_end - start));
+            start = key_end + 1;
+
+            if (start >= (size_t)read_len) break;
+
+            size_t value_end = buf_view.find('\0', start);
+            if (value_end == std::string_view::npos) break;
+            std::string value(buf_view.substr(start, value_end - start));
+            start = value_end + 1;
+            
+            g_spoof_properties[key] = value;
+        }
+
+        if (!g_spoof_properties.empty()) {
+            do_hook(api);
+
+            is_jni_hooking = true;
+            spoofDevice(env);
+            is_jni_hooking = false;
+        }
+        
+        api->setOption(zygisk::Option::FORCE_DENYLIST_UNMOUNT);
     }
 
 private:
-    Api *api = nullptr;
-    JNIEnv *env = nullptr;
-
-    void ensureBuildClass() {
-        std::call_once(build_class_init_flag, [this]() {
-            jclass localClass = env->FindClass("android/os/Build");
-            if (!localClass || checkAndClearException(env, "FindClass(Build)")) {
-                LOGE("Failed to find Build class");
-                return;
-            }
-
-            buildClass = (jclass)env->NewGlobalRef(localClass);
-            env->DeleteLocalRef(localClass);
-
-            if (!buildClass) {
-                LOGE("Failed to create global ref for Build class");
-                return;
-            }
-
-            modelField = env->GetStaticFieldID(buildClass, "MODEL", "Ljava/lang/String;");
-            brandField = env->GetStaticFieldID(buildClass, "BRAND", "Ljava/lang/String;");
-            deviceField = env->GetStaticFieldID(buildClass, "DEVICE", "Ljava/lang/String;");
-            manufacturerField = env->GetStaticFieldID(buildClass, "MANUFACTURER", "Ljava/lang/String;");
-            productField = env->GetStaticFieldID(buildClass, "PRODUCT", "Ljava/lang/String;");
-
-            if (!modelField || !brandField || !deviceField ||
-                !manufacturerField || !productField) {
-                LOGE("Failed to get Build field IDs");
-                checkAndClearException(env, "GetStaticFieldID");
-            } else {
-                LOGD("Build class initialized successfully");
-            }
-        });
-    }
-
-    void spoofDevice(const DeviceInfo& info) {
-        if (!buildClass) {
-            LOGE("Build class not initialized");
-            return;
-        }
-
-        auto setField = [this](jfieldID field, const std::string& value, const char* name) {
-            if (value.empty() || !field) return;
-
-            jstring jstr = env->NewStringUTF(value.c_str());
-            if (!jstr || checkAndClearException(env, "NewStringUTF")) {
-                LOGE("Failed to create string for %s", name);
-                return;
-            }
-
-            env->SetStaticObjectField(buildClass, field, jstr);
-            if (checkAndClearException(env, "SetStaticObjectField")) {
-                LOGE("Failed to set field %s", name);
-            }
-
-            env->DeleteLocalRef(jstr);
-        };
-
-        for (const auto& [key, value] : info) {
-            if (key == "ro.product.model") setField(modelField, value, "MODEL");
-            else if (key == "ro.product.brand") setField(brandField, value, "BRAND");
-            else if (key == "ro.product.device") setField(deviceField, value, "DEVICE");
-            else if (key == "ro.product.manufacturer") setField(manufacturerField, value, "MANUFACTURER");
-            else if (key == "ro.build.product") setField(productField, value, "PRODUCT");
-        }
-
-        LOGI("JNI fields spoofed based on config.");
-    }
-
-    void unloadModule() {
-        if (api) {
-            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
-            LOGD("Module unloaded (stealth mode)");
-        }
-    }
+    Api *api;
+    JNIEnv *env;
 };
 
-static void companion_handler(int socket_fd) {
-    // 确保初始化逻辑只执行一次
-    std::call_once(companion_init_flag, companion_init);
+// --- Companion Implementation ---
 
-    // 处理来自模块的单个请求
-    char pkg[256] = {0};
-    int bytes_read = read(socket_fd, pkg, sizeof(pkg));
-    if (bytes_read <= 0) {
-        LOGE("Companion: read error or client closed, errno: %d", errno);
-        close(socket_fd);
+static void companion_handler(int i) {
+    char lock_path[256];
+    snprintf(lock_path, sizeof(lock_path), "/data/adb/modules/%s/companion.lock", MODULE_ID);
+
+    int lock_fd = open(lock_path, O_RDONLY | O_CREAT, 0644);
+    if (lock_fd >= 0) {
+        if (flock(lock_fd, LOCK_EX) == -1) {
+            LOGD("Failed to acquire companion lock for %s", lock_path);
+        }
+    } else {
+        LOGD("Failed to open companion lock file %s", lock_path);
+    }
+
+    std::string config_data = read_config_blocking();
+    if (config_data.empty()) {
+        if (lock_fd >= 0) close(lock_fd);
+        close(i);
+        return;
+    }
+    
+    char target_package[256] = {0};
+    if (read(i, target_package, sizeof(target_package) -1) < 0) {
+        if (lock_fd >= 0) close(lock_fd);
+        close(i);
         return;
     }
 
-    LOGD("Companion: Received request for package: %s", pkg);
-    {
-        std::shared_lock<std::shared_mutex> lock(config_mutex);
-        auto it = package_map.find(pkg);
-        if (it != package_map.end()) {
-            const auto& props = it->second;
-            std::string buffer;
-            for (const auto& [key, val] : props) {
-                buffer.append(key);
-                buffer.push_back('\0');
-                buffer.append(val);
-                buffer.push_back('\0');
+    rapidjson::Document document;
+    document.Parse(config_data.c_str());
+
+    if (document.HasParseError() || !document.IsObject() || !document.HasMember("apps") || !document["apps"].IsArray()) {
+        if (lock_fd >= 0) close(lock_fd);
+        close(i);
+        return;
+    }
+
+    DeviceInfo properties;
+    const rapidjson::Value& apps = document["apps"];
+    for (const auto& app : apps.GetArray()) {
+        if (app.IsObject() && app.HasMember("package") && app["package"].IsString() &&
+            strcmp(app["package"].GetString(), target_package) == 0) {
+            
+            if (app.HasMember("properties") && app["properties"].IsObject()) {
+                for (const auto& prop : app["properties"].GetObject()) {
+                    if (prop.value.IsString()) {
+                        std::string value_str = prop.value.GetString();
+                        if (!value_str.empty()) {
+                            properties[prop.name.GetString()] = value_str;
+                        }
+                    }
+                }
             }
-            if (!buffer.empty()) {
-                write(socket_fd, buffer.c_str(), buffer.length());
-            }
+            break; 
         }
     }
-    close(socket_fd);
+    
+    std::string buffer_str;
+    for (const auto& [key, value] : properties) {
+        if (!value.empty()) {
+            buffer_str += key;
+            buffer_str += '\0';
+            buffer_str += value;
+            buffer_str += '\0';
+        }
+    }
+    
+    if (!buffer_str.empty()){
+        write_data_to_socket(i, buffer_str.c_str(), buffer_str.length());
+    }
+    
+    if (lock_fd >= 0) close(lock_fd); // Release the lock
+    close(i);
 }
 
+static void companion_init() {
+    char lock_path[256];
+    snprintf(lock_path, sizeof(lock_path), "/data/adb/modules/%s/companion.lock", MODULE_ID);
+
+    int lock_fd = open(lock_path, O_RDONLY | O_CREAT, 0644);
+    if (lock_fd < 0) return;
+
+    if (flock(lock_fd, LOCK_EX | LOCK_NB) < 0) {
+        close(lock_fd);
+        return;
+    }
+    
+    inotify_init_and_watch();
+}
 
 REGISTER_ZYGISK_MODULE(SpoofModule)
 REGISTER_ZYGISK_COMPANION(companion_handler)

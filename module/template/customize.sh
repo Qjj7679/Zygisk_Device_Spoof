@@ -56,9 +56,14 @@ extract "$ZIPFILE" 'sepolicy.rule' "$TMPDIR"
 ui_print "- Extracting module files"
 extract "$ZIPFILE" 'module.prop'     "$MODPATH"
 extract "$ZIPFILE" 'post-fs-data.sh' "$MODPATH"
+extract "$ZIPFILE" 'sepolicy.rule' "$MODPATH"
+
+ui_print "- Extracting config files"
 extract "$ZIPFILE" 'config/config.json' "$MODPATH"
-extract "$ZIPFILE" 'config/README.md' "$MODPATH"
-mv "$TMPDIR/sepolicy.rule" "$MODPATH"
+
+
+set_permissions
+
 
 HAS32BIT=false && ([ $(getprop ro.product.cpu.abilist32) ] || [ $(getprop ro.system.product.cpu.abilist32) ]) && HAS32BIT=true
 
@@ -85,5 +90,7 @@ else
   mv "$MODPATH/zygisk/lib$SONAME.so" "$MODPATH/zygisk/arm64-v8a.so"
 fi
 
-ui_print "- Setting permissions"
-set_perm_recursive "$MODPATH" 0 0 0755 0644
+set_permissions() {
+  ui_print "- Setting permissions"
+  set_perm_recursive "$MODPATH" 0 0 0755 0644
+}

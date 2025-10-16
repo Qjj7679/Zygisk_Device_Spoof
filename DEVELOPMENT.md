@@ -1,10 +1,10 @@
 # Zygisk Device Spoof 开发文档
 
 ## 1. 项目概述
-本项目是一个基于 Zygisk 的高性能 Android 设备信息伪装模块。它通过拦截 Zygote 进程孵化新应用的时机，为特定应用动态修改 `android.os.Build` 类中的设备信息字段。
+本项目是一个基于 Zygisk 的高性能 Android 设备信息伪装模块。它实现了一个**通用的、由配置驱动的属性伪装引擎**，通过双层 Hook 机制，为特定应用动态地、一致地修改设备属性信息。
 
 ## 2. 最终架构
-模块采用 **客户端-服务器 (Client-Server)** 架构，由 **Zygisk 模块**本身作为客户端，并利用 Zygisk 框架的特性启动一个常驻的 **Companion 进程**作为服务器。
+模块采用一种高效的**请求-响应**模型。**Zygisk 模块**作为客户端，在每个目标应用启动时，通过 Zygisk 框架与 **Companion 进程**进行一次性的 IPC 通信来获取伪装数据。
 
 ```mermaid
 graph TD
@@ -12,63 +12,76 @@ graph TD
         A[Zygote Process]
     end
 
-    subgraph "Companion Process (Singleton, Root)"
+    subgraph "Companion Process (Forked per Request, Root)"
         C[companion_handler]
-        C -- Ensures Uniqueness via --> G((companion.lock))
-        C -- Manages --> D{Config Cache<br/>(std::unordered_map)}
-        C -- Monitors Directory of --> E((config.json))
+        C -- Ensures Serial Execution via --> G((companion.lock))
+        C -- Reads & Parses --> E((config.json))
     end
 
     subgraph "App Process (Per-App)"
         B[SpoofModule]
         B -- 1. Connects & Sends Pkg --> C
-        C -- 2. Lookups Pkg --> D
-        D -- 3. Returns DeviceInfo --> C
-        C -- 4. Sends DeviceInfoIPC --> B
-        B -- 5. Spoofs Build Fields --> F[android.os.Build]
+        C -- 2. Finds Match & Serializes Props --> C
+        C -- 3. Sends Serialized Props via IPC --> B
+        B -- 4. Deserializes Props & Applies Hooks --> H{"Dual-Layer Hooking"}
+        H -- JNI Hook --> F[android.os.Build]
+        H -- Native PLT Hook --> I[libc.so<br>(__system_property_get)]
     end
 
     A -- Forks --> B
-    A -- Forks --> C
+    A -- Forks & Connects --> C
 ```
 
 ## 3. 核心机制详解
 
-### 3.1. Companion 进程 (`companion_handler` & `companion_init`)
-这是模块的核心，作为配置和服务的中心。
-- **职责**:
-  - 维护一份内存中的配置缓存 (`std::unordered_map`)。
-  - 监听来自 Zygisk 模块的 IPC 请求，查询并返回设备信息。
-  - 监控配置文件的变更，并执行热重载。
-- **关键实现**:
-  - **`std::call_once`**: 确保初始化逻辑 `companion_init` 在进程生命周期内只执行一次。
-  - **文件锁 (`flock`)**: 在 `companion_init` 中，通过对 `companion.lock` 文件加锁，保证了 Companion 进程的**单例性**，解决了多进程实例导致的数据陈旧问题。
-  - **目录监控 (`inotify`)**: `monitor_config_thread` 线程监控 `config` 目录而非单个文件，这使其能可靠地响应各种编辑器的“原子保存”行为，保证了**热重载的健壮性**。
-  - **线程安全 (`std::shared_mutex`)**: 在多线程环境（IPC 请求和热重载）下安全地访问配置缓存。
+### 3.1. 双层 Hook 机制
+这是模块伪装能力的核心，确保了最大程度的兼容性和一致性。
 
-### 3.2. Zygisk 模块 (`SpoofModule`)
-这是一个轻量级客户端，在每个目标应用进程中执行。
-- **职责**:
-  - 在 `preAppSpecialize` 阶段获取当前应用的包名。
-  - 通过 Zygisk API 连接到 Companion 进程。
-  - 发送包名并接收包含伪造信息的 `DeviceInfoIPC` 结构体。
-  - 根据 `match_found` 标志位决定是否调用 JNI 函数修改 `android.os.Build` 字段。
-- **关键实现**:
-  - **IPC 通信**: 通过 `api->connectCompanion()` 建立与服务端的 socket 连接，进行一次性的请求-响应通信。
-  - **隐蔽性**: 在完成任务后，立即调用 `api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY)` 从进程中卸载自身。
+- **JNI 层 Hook (`spoofDevice`)**:
+  - **目标**: `android.os.Build` 类。
+  - **实现**: 在 `preAppSpecialize` 阶段，通过 JNI `SetStaticObjectField` 函数直接修改 `android.os.Build` 类的静态字段（如 `MODEL`, `BRAND` 等）。
+  - **作用**: 覆盖通过标准 Android Java API 获取设备信息的应用。
 
-### 3.3. 配置文件 (`config.json`)
-- **路径**: `/data/adb/modules/zygisk_device_spoof/config/config.json` (模块安装时会自动创建)
-- **灵活性**: 支持部分伪造（JSON 中未提供的字段不会被修改）和空值忽略（值为空字符串 `""` 的字段不会被修改）。这是通过 C++ 代码中的 `if (value.empty())` 判断实现的。
+- **Native 层 Hook (`my_system_property_get`)**:
+  - **目标**: `libc.so` 中的 `__system_property_get` 函数。
+  - **实现**: 使用 Zygisk 的 `pltHookRegister` API，在运行时替换 `__system_property_get` 函数的地址。
+  - **作用**: 拦截所有直接通过底层 C/C++ 库查询系统属性的调用，这是许多游戏和加固应用获取设备信息的方式。
+
+- **重入保护 (`is_jni_hooking`)**:
+  - **问题**: 在 JNI Hook 执行期间，内部实现可能会触发 `__system_property_get`，如果此时 Native Hook 也生效，会造成无限递归或死锁。
+  - **方案**: 使用 `thread_local bool is_jni_hooking` 变量作为卫兵。在执行 `spoofDevice` 之前将其设为 `true`，之后设为 `false`。`my_system_property_get` 函数会检查此标志，如果为 `true`，则直接调用原始函数，从而打破了循环依赖。
+
+### 3.2. Companion 进程 (`companion_handler`)
+这是一个按需唤醒的辅助进程，负责安全地提供配置信息。
+
+- **职责**:
+  - 接收来自 Zygisk 模块的 IPC 连接，并读取目标应用的包名。
+  - 读取并解析 `config.json` 文件。
+  - 查找与目标包名匹配的伪装规则。
+  - 将匹配到的所有属性序列化为一个长字符串（键和值由 `\0` 分隔）。
+  - 将序列化后的字符串通过 socket 写回给 Zygisk 模块。
+- **关键实现**:
+  - **串行执行 (`flock`)**: 在处理请求的开始，通过对 `companion.lock` 文件加锁 (`LOCK_EX`)，保证了即使多个应用同时启动，Companion 进程也能串行、安全地访问配置文件，从根本上杜绝了文件读取的竞争条件。
+  - **一次性**: 每个 Companion 进程在完成一次请求-响应后即退出，不作为常驻服务，资源占用低。
+
+### 3.3. Zygisk 模块 (`SpoofModule`)
+这是在每个目标应用进程中执行的轻量级客户端。
+
+- **职责**:
+  - 在 `preAppSpecialize` 阶段，通过 `api->connectCompanion()` 连接到 Companion 进程。
+  - 发送包名并接收序列化的属性数据。
+  - 将接收到的数据反序列化，存入全局的 `g_spoof_properties` 中。
+  - 如果收到了有效的伪装数据，则启动并应用**双层 Hook 机制**。
+- **关键实现**:
+  - **隐蔽性**: 在完成任务后，调用 `api->setOption(zygisk::Option::FORCE_DENYLIST_UNMOUNT)` 将自身从应用的 Denylist 中移除，增加了隐蔽性。
+
+### 3.4. 配置文件 (`config.json`)
+- **路径**: `/data/adb/modules/zygisk_device_spoof/config/config.json`
+- **灵活性**:
+    - **部分伪装**: JSON 中未提供的属性不会被修改。
+    - **空值忽略**: 值为空字符串 `""` 的属性会被自动忽略。
 
 ## 4. 后续开发注意事项
-- **扩展性**:
-  - **新增伪造字段**: 如果需要伪造 `android.os.Build` 中的其他字段，只需：
-    1.  在 `DeviceInfo` 和 `DeviceInfoIPC` 结构体中增加新成员。
-    2.  在 `ensureBuildClass()` 中获取新字段的 `jfieldID`。
-    3.  在 `reloadConfig()` 中增加对新字段的 JSON 解析逻辑。
-    4.  在 `companion_handler()` 和 `preAppSpecialize()` 中增加新字段的数据复制逻辑。
-    5.  在 `spoofDevice()` 中增加对新字段的 `setField` 调用。
 - **调试**:
   - `device_spoof.cpp` 文件顶部的 `DEBUG` 宏控制着日志的输出。在开发时可以打开它以获取详细的 `LOGD` 输出。
 - **依赖**:
