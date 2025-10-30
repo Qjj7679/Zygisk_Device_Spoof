@@ -1,79 +1,76 @@
 # Zygisk Device Spoof
 
-这是一个功能强大且高度优化的 Zygisk 模块，旨在为特定的 Android 应用程序动态修改设备信息。它实现了一个**通用的、由配置驱动的属性伪装引擎**，允许您伪装任意系统属性。
+一个经过全面重构的 Zygisk 模块，旨在以一种现代化、稳定且高效的方式为特定 Android 应用程序动态修改设备属性。
 
 ## ✨ 核心特性
 
-- **通用伪装引擎**: 不再局限于固定的设备字段，您可以通过配置文件伪装**任意**您需要的系统属性，例如 `ro.product.board` 或 `ro.build.version.security_patch`。
-- **双层 Hook 机制**:
-  - **JNI 层**: 动态修改 `android.os.Build` 类中的设备信息字段。
-  - **原生层**: 通过 Zygisk 的 PLT Hook 技术，直接 Hook 底层 C 库的 `__system_property_get` 函数。
-  - 这确保了无论应用通过哪种方式获取设备信息，都能得到伪装后的值，大大提高了伪装的成功率和一致性。
-- **高性能架构**: 采用 **Zygisk Companion 守护进程**模型。所有配置的读取和解析都在一个独立的、以 root 权限运行的进程中完成，在应用启动时通过 IPC 高效地传递伪装数据，极大地降低了对应用启动性能的影响。
-- **隐蔽性**: 模块在对目标应用完成注入后，会自动从其进程空间中卸载（`FORCE_DENYLIST_UNMOUNT`），增加了隐蔽性。
-- **稳定可靠**: 通过优化的文件锁机制解决了高并发场景下的启动卡死问题，确保模块在多应用同时启动时也能稳定运行。
-- **灵活的配置规则**:
-  - **部分伪装**: 您可以只在配置文件中提供需要修改的属性，未提供的属性将保持应用原始值不变。
-  - **空值忽略**: 对于配置文件中值为空字符串 `""` 的属性，模块会自动忽略，不会进行修改。
+- **高度专注**: 模块经过精简，仅专注于伪装 `ro.product.brand` 和 `ro.product.model` 两个核心设备标识属性。
+- **现代化 C++20 架构**: 整个项目代码库使用 C++20 标准重写，利用现代 C++ 特性提升代码的可读性、安全性和性能。
+- **动态配置加载**: **无需重启手机**！当您修改配置文件后，只需重启目标应用，新的伪装配置即可立即生效。
+- **简化的配置格式**: 配置文件使用直观的简称（`brand`, `model`）代替完整的属性名，使配置过程更简单、更不易出错。
+- **健壮的双层 Hook 机制**:
+  - **JNI 层**: 直接修改 `android.os.Build` 类的静态字段 (`BRAND`, `MODEL`)。
+  - **原生层 (PLT Hook)**: 拦截底层的 `__system_property_get` 系统调用。
+  - 双层机制确保了极高的伪装成功率和一致性。
+- **性能优先**:
+  - **Zygisk Companion 进程架构**: 所有耗时的文件 I/O 和 JSON 解析操作均在一个独立的后台进程中完成，完全不阻塞应用启动，从根本上解决了卡顿问题。
+  - **`simdjson` 解析器**: 使用业界领先的高性能 JSON 解析库 `simdjson`，确保配置文件加载过程极速完成。
+- **高稳定性与隐蔽性**:
+  - **安全的初始化流程**: 严格遵守 Zygisk 开发规范，在 `onLoad` 阶段不做任何敏感操作，杜绝了影响系统启动的可能性。
+  - **无日志 Hook**: 在高性能的 Hook 回调函数中严格禁止任何日志输出，避免了潜在的应用卡死风险和特征检测。
+  - **强制卸载 (Denylist Unmount)**: 自动为目标进程强制卸载 Magisk 和模块相关的文件挂载点，有效对抗基于文件路径的检测。
 
 ## 🔧 如何使用
 
 ### 1. 配置文件
 
-模块的所有行为都由一个 JSON 配置文件控制。
+- **路径**: `/data/adb/modules/zygisk_device_spoof/config/config.json`
+  *(模块安装后首次启动应用时会自动创建此文件)*
 
-- **配置文件路径**: `/data/adb/modules/zygisk_device_spoof/config/config.json`
-  *(配置文件和目录在安装模块时自动创建并使用默认配置)*
-
-- **配置文件格式**:
+- **格式**:
   ```json
   {
     "apps": [
       {
         "package": "com.example.targetapp",
         "properties": {
-          "ro.product.brand": "Google",
-          "ro.product.model": "Pixel 7",
-          "ro.product.manufacturer": "Google",
-          "ro.product.device": "cheetah",
-          "ro.build.product": "cheetah"
+          "brand": "Google",
+          "model": "Pixel 7"
         }
       },
       {
-        "package": "com.example.targetapp2",
+        "package": "com.example.anotherapp",
         "properties": {
-          "ro.product.brand": "Samsung",
-          "ro.product.model": "Galaxy S23",
-          "ro.build.version.security_patch": "2023-10-05"
+          "brand": "Samsung",
+          "model": "Galaxy S23"
         }
       }
     ]
   }
   ```
-- **配置说明**:
-  - `package`: 目标应用的包名。
-  - `properties`: 一个 JSON 对象，包含了所有您想要伪装的属性。
-    - **键 (Key)**: 必须是您想要伪装的**标准 Android 系统属性名称** (例如 `ro.product.model`)。
-    - **值 (Value)**: 您想要设置的伪装值。
+- **字段说明**:
+  - `package`: (字符串) 目标应用的包名。
+  - `properties`: (对象) 一个包含伪装属性的 JSON 对象：
+    - `"brand"`: (字符串) 您想要伪装的品牌名称。
+    - `"model"`: (字符串) 您想要伪装的型号名称。
 
-### 2. 生效方式
-- 将模块刷入 Magisk / Kernel SU / APatch 并重启手机。
-- 在指定路径下找到 `config.json` 文件并编辑您的规则。
-- **修改配置后，需要重启目标应用或重启手机才能生效。**
+### 2. 应用配置
+
+1.  将模块刷入 Magisk 并重启手机。
+2.  编辑 `config.json` 文件以定义您的伪装规则。
+3.  **强行停止并重启目标应用**，新的配置即刻生效。
 
 ## 🛠️ 如何编译
 
-1.  确保您已配置好 Android NDK 开发环境。
+1.  确保您已配置好 Android NDK (推荐版本 r25c 或更高) 开发环境。
 2.  在项目根目录运行 Gradle 任务:
-    - 编译 Debug 版本的模块包:
+    - **编译 Debug 版本**:
       ```bash
       ./gradlew :module:zipDebug
       ```
-    - 编译 Release 版本的模块包:
+    - **编译 Release 版本**:
       ```bash
       ./gradlew :module:zipRelease
       ```
 3.  编译好的 Magisk 模块 Zip 包将位于 `module/release/` 目录下。
 
----
-*该项目基于 Zygisk Module Template 进行深度开发和优化。*

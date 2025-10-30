@@ -3,21 +3,15 @@
     {
       "package": "com.example.targetapp",
       "properties": {
-        "ro.product.brand": "Google",
-        "ro.product.model": "Pixel 7",
-        "ro.product.manufacturer": "Google",
-        "ro.product.device": "cheetah",
-        "ro.build.product": "cheetah"
+        "brand": "Google",
+        "model": "Pixel 7"
       }
     },
     {
-      "package": "com.example.targetapp2",
+      "package": "com.example.anotherapp",
       "properties": {
-        "ro.product.brand": "Samsung",
-        "ro.product.model": "Galaxy S23",
-        "ro.product.manufacturer": "Samsung",
-        "ro.product.device": "dm3q",
-        "ro.build.product": "dm3qxxx"
+        "brand": "Samsung",
+        "model": "Galaxy S23"
       }
     }
   ]
