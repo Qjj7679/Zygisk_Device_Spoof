@@ -47,16 +47,25 @@ public:
 
         write(fd, app_name.c_str(), app_name.length() + 1);
 
-        char buffer[4096] = {};
-        int read_len = read(fd, buffer, sizeof(buffer) - 1);
+        std::string props_buffer;
+        char chunk[1024];
+        ssize_t bytes_read;
+        while ((bytes_read = read(fd, chunk, sizeof(chunk))) > 0) {
+            props_buffer.append(chunk, bytes_read);
+        }
         close(fd);
 
-        if (read_len <= 0) {
+        if (bytes_read < 0) {
+            LOGD("Failed to read from companion for %s", app_name.c_str());
+            return;
+        }
+
+        if (props_buffer.empty()) {
             return;
         }
 
         std::unordered_map<std::string, std::string> properties;
-        std::string_view buf_view(buffer, read_len);
+        std::string_view buf_view(props_buffer);
         size_t start = 0;
         while (start < buf_view.length()) {
             size_t key_end = buf_view.find('\0', start);
@@ -93,11 +102,12 @@ static void companion_handler(int socket_fd) {
     static ConfigManager configManager;
     
     char app_name[256] = {};
-    read(socket_fd, app_name, sizeof(app_name) - 1);
-    if (strlen(app_name) == 0) {
+    ssize_t bytes_read = read(socket_fd, app_name, sizeof(app_name) - 1);
+    if (bytes_read <= 0) {
         close(socket_fd);
         return;
     }
+    app_name[bytes_read] = '\0';
 
     configManager.loadOrReloadConfig();
 

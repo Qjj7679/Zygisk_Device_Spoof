@@ -31,7 +31,7 @@ const std::map<std::string, std::string> JNI_KEY_TO_FIELD = {
 };
 
 // Thread-local storage for passing app-specific properties to the static hook function.
-thread_local const std::unordered_map<std::string, std::string>* thread_local_spoof_properties = nullptr;
+thread_local std::unordered_map<std::string, std::string> thread_local_spoof_properties;
 
 
 // --- Helper Functions ---
@@ -78,7 +78,7 @@ void HookManager::applyHooks(JNIEnv* env, const std::unordered_map<std::string, 
 }
 
 void HookManager::installNativeHook(const std::unordered_map<std::string, std::string>& properties) {
-    thread_local_spoof_properties = &properties;
+    thread_local_spoof_properties = properties;
 
     ensure_libc_info();
 
@@ -100,17 +100,8 @@ void HookManager::installNativeHook(const std::unordered_map<std::string, std::s
 }
 
 void HookManager::spoofJniFields(JNIEnv* env, const std::unordered_map<std::string, std::string>& properties) {
-    if (!build_class_global_ref) {
-        jclass local_build_class = env->FindClass("android/os/Build");
-        if (local_build_class == nullptr) {
-            LOGD("Failed to find android.os.Build class.");
-            return;
-        }
-        build_class_global_ref = (jclass)env->NewGlobalRef(local_build_class);
-        env->DeleteLocalRef(local_build_class);
-    }
-
-    if (build_class_global_ref == nullptr) {
+    jclass local_build_class = env->FindClass("android/os/Build");
+    if (local_build_class == nullptr) {
         LOGD("Failed to find android.os.Build class.");
         return;
     }
@@ -125,7 +116,7 @@ void HookManager::spoofJniFields(JNIEnv* env, const std::unordered_map<std::stri
                 continue;
             }
             const std::string& field_name = jni_it->second;
-            field_id = env->GetStaticFieldID(build_class_global_ref, field_name.c_str(), "Ljava/lang/String;");
+            field_id = env->GetStaticFieldID(local_build_class, field_name.c_str(), "Ljava/lang/String;");
             if (field_id) {
                 field_ids[key] = field_id;
             }
@@ -133,16 +124,18 @@ void HookManager::spoofJniFields(JNIEnv* env, const std::unordered_map<std::stri
         
         if (field_id != nullptr) {
             jstring spoof_value = env->NewStringUTF(value.c_str());
-            env->SetStaticObjectField(build_class_global_ref, field_id, spoof_value);
+            env->SetStaticObjectField(local_build_class, field_id, spoof_value);
             env->DeleteLocalRef(spoof_value);
         } else {
             env->ExceptionClear();
         }
     }
+
+    env->DeleteLocalRef(local_build_class);
 }
 
 int HookManager::hooked_system_property_get(const char* name, char* value) {
-    if (name == nullptr || thread_local_spoof_properties == nullptr) {
+    if (name == nullptr || thread_local_spoof_properties.empty()) {
         return original_system_property_get(name, value);
     }
     
@@ -155,8 +148,8 @@ int HookManager::hooked_system_property_get(const char* name, char* value) {
 
     for (const auto& [key, prop_name] : KEY_TO_PROP) {
         if (strcmp(name, prop_name.c_str()) == 0) {
-            auto it = thread_local_spoof_properties->find(key);
-            if (it != thread_local_spoof_properties->end()) {
+            auto it = thread_local_spoof_properties.find(key);
+            if (it != thread_local_spoof_properties.end()) {
                 strncpy(value, it->second.c_str(), PROPERTY_VALUE_MAX - 1);
                 value[PROPERTY_VALUE_MAX - 1] = '\0';
                 in_hook = false;

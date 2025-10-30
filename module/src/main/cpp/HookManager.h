@@ -25,7 +25,6 @@ private:
     dev_t libc_dev = 0;
     ino_t libc_ino = 0;
 
-    jclass build_class_global_ref = nullptr;
     std::unordered_map<std::string, jfieldID> field_ids;
     
     static int (*original_system_property_get)(const char*, char*);
